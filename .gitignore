@@ -1,0 +1,4 @@
+#ignore folder __pycache__, data, and fl_env
+__pycache__/
+data/
+fl_env/
