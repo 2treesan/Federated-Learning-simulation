@@ -1,4 +1,6 @@
-#ignore folder __pycache__, data, and fl_env
+#ignore all folder __pycache__ (include protocol1/__pycache__), data, and fl_env
 __pycache__/
+protocol1/__pycache__/
+protocol1/data/
 data/
 fl_env/

@@ -19,8 +19,10 @@ except Exception:
     pass
 
 # ===== JSON options =====
-JSON_NDIGITS = int(os.environ.get("P0_JSON_NDIGITS", "6"))  # số chữ số sau dấu phẩy để làm tròn
-JSON_SPLIT_PER_EPOCH = os.environ.get("P0_JSON_SPLIT", "0") == "1"  # nếu "1": ghi mỗi epoch 1 file
+JSON_NDIGITS = int(os.environ.get("P0_JSON_NDIGITS", "6"))  # làm tròn số
+JSON_SPLIT_PER_EPOCH = os.environ.get("P0_JSON_SPLIT", "0") == "1"  # ghi mỗi epoch 1 file?
+JSON_HEAD = int(os.environ.get("P0_JSON_HEAD", "5"))  # số phần tử đầu
+JSON_TAIL = int(os.environ.get("P0_JSON_TAIL", "5"))  # số phần tử cuối
 
 def get_initial_parameters():
     model = SimpleMLP()
@@ -64,14 +66,19 @@ def _evaluate_on_server(nds):
             total += data.size(0)
     return float(total_loss / total), float(correct / total)
 
-def _round_list(arr: np.ndarray, ndigits: int = JSON_NDIGITS):
-    """Làm tròn mảng float và convert sang list để ghi JSON (giảm dung lượng + dễ xem)."""
+def _head_tail(arr: np.ndarray, head: int = JSON_HEAD, tail: int = JSON_TAIL, ndigits: int = JSON_NDIGITS):
+    """Trích 5 số đầu + '...' + 5 số cuối (hoặc ít hơn nếu mảng ngắn)."""
     if arr is None:
         return []
-    arr = np.asarray(arr, dtype=np.float32)
+    arr = np.asarray(arr, dtype=np.float32).flatten()
     if ndigits is not None:
-        arr = np.round(arr, ndigits=ndigits)
-    return arr.tolist()
+        arr = np.round(arr, decimals=int(ndigits))
+    n = arr.size
+    if n <= head + tail:
+        return arr.tolist()
+    head_list = arr[:head].tolist()
+    tail_list = arr[-tail:].tolist()
+    return head_list + ["..."] + tail_list  # vẫn là JSON hợp lệ
 
 class P0FedAvg(FedAvg):
     def __init__(self, **kwargs):
@@ -88,12 +95,10 @@ class P0FedAvg(FedAvg):
             pass
 
     def _dump_main_json(self):
-        """Ghi file JSON tổng hợp với indent/sort_keys để dễ đọc."""
         with open(self.json_path, "w", encoding="utf-8") as f:
             json.dump(self.protocol_log, f, ensure_ascii=False, indent=2, sort_keys=True)
 
     def _dump_epoch_json(self, server_round: int, epoch_entry: dict):
-        """Nếu bật split, ghi mỗi epoch một file riêng có định dạng đẹp."""
         if not JSON_SPLIT_PER_EPOCH:
             return
         ep_path = f"protocol0_epoch_{server_round}.json"
@@ -157,32 +162,30 @@ class P0FedAvg(FedAvg):
         loss, acc = _evaluate_on_server(accum)
         print(f"  • Server Eval => loss={loss:.6f}, acc={acc:.4f}\n")
 
-        # ===== Ghi JSON (đẹp + gọn) =====
-        epoch_key = f"epoch_{server_round}"
+        # ===== Ghi JSON (đẹp + rút gọn head-tail) =====
+        epoch_key = f"epoch {server_round}"  # đổi format theo yêu cầu
         epoch_entry = {}
 
-        # client0/1/2 unmasked & masked (rounded)
+        # client0/1/2 unmasked & masked (head-tail)
         for r in sorted(client_unmasked_flat.keys()):
-            epoch_entry[f"client{r}_unmasked"] = _round_list(client_unmasked_flat[r], JSON_NDIGITS)
+            epoch_entry[f"client {r} (unmasked)"] = _head_tail(client_unmasked_flat[r])
         for r in sorted(client_masked_flat.keys()):
-            epoch_entry[f"client{r}_masked"] = _round_list(client_masked_flat[r], JSON_NDIGITS)
+            epoch_entry[f"client {r} (masked)"] = _head_tail(client_masked_flat[r])
 
         # tổng (unmasked & masked)
-        epoch_entry["sum_unmasked"] = _round_list(unmasked_total_flat, JSON_NDIGITS)
-        epoch_entry["sum_masked"]   = _round_list(masked_total_flat, JSON_NDIGITS)
+        epoch_entry["sum (unmasked)"] = _head_tail(unmasked_total_flat)
+        epoch_entry["sum (masked)"]   = _head_tail(masked_total_flat)
 
-        # loss & acc của server
+        # loss & acc của server (làm tròn)
         epoch_entry["loss"] = float(round(loss, JSON_NDIGITS if JSON_NDIGITS else 6))
         epoch_entry["accuracy"] = float(round(acc, JSON_NDIGITS if JSON_NDIGITS else 6))
 
-        # bộ trọng số toàn cục gửi về (flatten + rounded)
-        epoch_entry["server_global_weights"] = _round_list(_flatten(accum), JSON_NDIGITS)
+        # bộ trọng số toàn cục gửi về (flatten head-tail)
+        epoch_entry["server global weights"] = _head_tail(_flatten(accum))
 
-        # Lưu vào log tổng hợp và ghi ra file với indent
+        # Lưu vào log tổng hợp và ghi ra file
         self.protocol_log[epoch_key] = epoch_entry
-        # Ghi file per-epoch nếu bật (để dễ mở từng epoch)
         self._dump_epoch_json(server_round, epoch_entry)
-        # Ghi file tổng hợp (indent=2, sort_keys=True)
         self._dump_main_json()
 
         aggregated = ndarrays_to_parameters([a for a in accum])
