@@ -11,16 +11,14 @@ import numpy as np
 import torch
 from torch import nn
 
-# ===== Cấu hình số client kỳ vọng =====
+# ===== tham số =====
 P1_NCLIENTS = int(os.environ.get("P1_NCLIENTS", "5"))
-
-# ===== JSON options =====
-JSON_NDIGITS = int(os.environ.get("P1_JSON_NDIGITS", "6"))     # làm tròn khi in
-JSON_HEAD = int(os.environ.get("P1_JSON_HEAD", "5"))           # head size
-JSON_TAIL = int(os.environ.get("P1_JSON_TAIL", "5"))           # tail size
+JSON_NDIGITS = int(os.environ.get("P1_JSON_NDIGITS", "6"))
+JSON_HEAD = int(os.environ.get("P1_JSON_HEAD", "5"))
+JSON_TAIL = int(os.environ.get("P1_JSON_TAIL", "5"))
 JSON_SPLIT_PER_EPOCH = os.environ.get("P1_JSON_SPLIT", "0") == "1"
 
-# Dọn registry rank cũ mỗi lần chạy lại (để 5 client xếp rank 0..4)
+# Dọn registry
 try:
     if os.path.exists("p0_registry.json"):
         os.remove("p0_registry.json")
@@ -69,123 +67,138 @@ def _evaluate_on_server(nds):
             total += data.size(0)
     return float(total_loss / total), float(correct / total)
 
-def _head_tail(arr: np.ndarray, head: int = JSON_HEAD, tail: int = JSON_TAIL, ndigits: int = JSON_NDIGITS):
-    if arr is None:
-        return []
-    arr = np.asarray(arr, dtype=np.float32).flatten()
+# ===== JSON helpers: in 1 dòng/list =====
+def _fmt_line(arr, ndigits=JSON_NDIGITS):
+    """Format list số trên MỘT dòng: [a, b, c, ..., y, z]"""
+    def fmt(x):
+        if ndigits is None:
+            return str(float(x))
+        return f"{float(x):.{int(ndigits)}f}"
+    return "[" + ", ".join(arr) + "]"
+
+def _head_tail_str(array_like, head=JSON_HEAD, tail=JSON_TAIL, ndigits=JSON_NDIGITS):
+    if array_like is None:
+        return "[]"
+    arr = np.asarray(array_like, dtype=np.float32).ravel()
     if ndigits is not None:
         arr = np.round(arr, decimals=int(ndigits))
     n = arr.size
+    elems = []
     if n <= head + tail:
-        return arr.tolist()
-    head_list = arr[:head].tolist()
-    tail_list = arr[-tail:].tolist()
-    return head_list + ["..."] + tail_list
+        elems = [f"{float(x):.{int(ndigits)}f}" for x in arr]
+    else:
+        head_list = [f"{float(x):.{int(ndigits)}f}" for x in arr[:head]]
+        tail_list = [f"{float(x):.{int(ndigits)}f}" for x in arr[-tail:]]
+        elems = head_list + ['"..."'] + tail_list  # giữ "..." là chuỗi
+    return "[" + ", ".join(elems) + "]"
+
+def _unflatten_like(vec_flat: np.ndarray, template_nds):
+    """Chuyển vector phẳng -> list np.array theo shape của template_nds."""
+    out, idx = [], 0
+    for a in template_nds:
+        size = a.size
+        part = vec_flat[idx: idx + size].reshape(a.shape).astype(np.float32)
+        out.append(part)
+        idx += size
+    return out
 
 class P1FedAvg(FedAvg):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.json_path = "protocol1.json"
         self.protocol_log = {}
-        self.expected_alive = set(range(P1_NCLIENTS))  # round 1: giả định đủ N client
-        self._ensure_clean_json()
+        self.expected_alive = set(range(P1_NCLIENTS))
+        self._reset_json()
 
-    def _ensure_clean_json(self):
+    def _reset_json(self):
         try:
             if os.path.exists(self.json_path):
                 os.remove(self.json_path)
         except Exception:
             pass
 
-    def _dump_main_json(self):
+    def _dump(self, server_round: int, entry: dict):
+        self.protocol_log[f"epoch {server_round}"] = entry
+        if JSON_SPLIT_PER_EPOCH:
+            with open(f"protocol1_epoch_{server_round}.json", "w", encoding="utf-8") as f:
+                json.dump(entry, f, ensure_ascii=False, indent=2, sort_keys=True)
         with open(self.json_path, "w", encoding="utf-8") as f:
             json.dump(self.protocol_log, f, ensure_ascii=False, indent=2, sort_keys=True)
 
-    def _dump_epoch_json(self, server_round: int, epoch_entry: dict):
-        if not JSON_SPLIT_PER_EPOCH:
-            return
-        ep_path = f"protocol1_epoch_{server_round}.json"
-        with open(ep_path, "w", encoding="utf-8") as f:
-            json.dump(epoch_entry, f, ensure_ascii=False, indent=2, sort_keys=True)
-
     def aggregate_fit(self, server_round, results, failures):
         print(f"\n[P1-Server] Nhận {len(results)} kết quả fit ở Round {server_round}:")
-        client_masked_nds = []
-        client_unmasked_flat = {}
-        client_masked_flat = {}
-        client_contribs = {}  # rank -> {peer_rank -> np.ndarray}
-
-        received_ranks = set()
+        # thu thập
+        masked_nds_list = []
+        per_client_weight = []
+        unmasked_flat = {}
+        masked_flat = {}
+        contribs = {}  # rank -> {peer_rank: vec_flat}
+        survivors = set()
 
         for client_proxy, fit_res in results:
             cid = getattr(client_proxy, "cid", "unknown")
-            nds = parameters_to_ndarrays(fit_res.parameters)  # MASKED
+            nds = parameters_to_ndarrays(fit_res.parameters)  # masked
             print(f"  • From client {cid}: preview(masked) = {_preview(nds)} (n={fit_res.num_examples})")
-            client_masked_nds.append(nds)
+            masked_nds_list.append(nds)
+            per_client_weight.append(fit_res.num_examples)
 
-            metrics = fit_res.metrics or {}
-            rank = int(metrics.get("rank", "-1"))
-            if rank < 0:
-                raise RuntimeError("Client không gửi 'rank' trong metrics.")
-            received_ranks.add(rank)
+            m = fit_res.metrics or {}
+            rank = int(m.get("rank", "-1"))
+            survivors.add(rank)
+            unmasked_flat[rank] = np.array(json.loads(m.get("unmasked_flat", "[]")), dtype=np.float32)
+            masked_flat[rank]   = np.array(json.loads(m.get("masked_flat", "[]")), dtype=np.float32)
+            cdict = json.loads(m.get("contribs", "{}"))
+            contribs[rank] = {int(k): np.array(v, dtype=np.float32) for k, v in cdict.items()}
 
-            uflat = np.array(json.loads(metrics.get("unmasked_flat", "[]")), dtype=np.float32)
-            mflat = np.array(json.loads(metrics.get("masked_flat", "[]")), dtype=np.float32)
-            contribs_dict = json.loads(metrics.get("contribs", "{}"))
-
-            client_unmasked_flat[rank] = uflat
-            client_masked_flat[rank] = mflat
-
-            per_peer = {}
-            for k, v in contribs_dict.items():
-                per_peer[int(k)] = np.array(v, dtype=np.float32)
-            client_contribs[rank] = per_peer
-
-        # Xác định dropouts so với kỳ vọng cho vòng này
-        dropouts = sorted(list(self.expected_alive - received_ranks))
-        survivors = sorted(list(received_ranks))
+        # dropout
+        dropouts = sorted(list(self.expected_alive - survivors))
+        survivors = sorted(list(survivors))
         print(f"  • Survivors: {survivors} | Dropouts: {dropouts}")
 
-        # Tổng masked như nhận được
+        # tổng masked (survivors)
         masked_total_flat = None
-        if client_masked_nds:
-            stacked = [_flatten(nds) for nds in client_masked_nds]
+        if masked_nds_list:
+            stacked = [_flatten(nds) for nds in masked_nds_list]
             masked_total_flat = np.sum(np.stack(stacked, axis=0), axis=0).astype(np.float32)
-            print(f"  • Tổng (masked) preview: {_head_tail(masked_total_flat)}")
 
-        # Tổng unmasked (chỉ từ client còn sống)
+        # tổng unmasked (survivors) — để kiểm chứng
         unmasked_total_flat = None
-        if client_unmasked_flat:
-            arrs = [client_unmasked_flat[r] for r in survivors]
+        if unmasked_flat:
+            arrs = [unmasked_flat[r] for r in survivors]
             unmasked_total_flat = np.sum(np.stack(arrs, axis=0), axis=0).astype(np.float32)
 
-        # Khôi phục phần mask của người rớt: sum_u contrib[u][v] với mọi v thuộc dropouts
-        recovery_total = None
-        if dropouts:
-            acc = None
-            for u in survivors:
-                per_peer = client_contribs.get(u, {})
-                # cộng tất cả contributions hướng tới các dropout
-                for v in dropouts:
-                    if v in per_peer:
-                        vec = per_peer[v]
-                        acc = vec.astype(np.float32) if acc is None else (acc + vec.astype(np.float32))
-            recovery_total = acc if acc is not None else np.zeros_like(masked_total_flat, dtype=np.float32)
-            print(f"  • Recovery (sum contribs tới dropouts) preview: {_head_tail(recovery_total)}")
+        # ======= UNMASK THEO TỪNG CLIENT trước FedAvg =======
+        corrected_nds_list = []
+        recovery_total = np.zeros_like(masked_total_flat, dtype=np.float32) if masked_total_flat is not None else None
 
-        # Sau khi khử phần dropouts, masked_total -> nên trùng unmasked_total
-        if masked_total_flat is not None and recovery_total is not None:
+        for nds, w, rank in zip(masked_nds_list, per_client_weight, survivors):
+            # vector correction cho client này: sum_{v in dropouts} contribs[rank][v]
+            corr_vec = None
+            per_peer = contribs.get(rank, {})
+            for v in dropouts:
+                if v in per_peer:
+                    vec = per_peer[v]
+                    corr_vec = vec.astype(np.float32) if corr_vec is None else (corr_vec + vec.astype(np.float32))
+            if corr_vec is None:
+                corr_vec = np.zeros_like(_flatten(nds), dtype=np.float32)
+            else:
+                recovery_total += corr_vec
+
+            # trừ correction khỏi ND arrays của client này
+            corr_parts = _unflatten_like(corr_vec, nds)
+            corrected = [a.astype(np.float32) - c.astype(np.float32) for a, c in zip(nds, corr_parts)]
+            corrected_nds_list.append((corrected, w))
+
+        # kiểm chứng: (sum masked) - (sum recovery) ≈ (sum unmasked)
+        if masked_total_flat is not None and recovery_total is not None and unmasked_total_flat is not None:
             masked_minus_recovery = masked_total_flat - recovery_total
-            diff_norm = float(np.linalg.norm(masked_minus_recovery - unmasked_total_flat))
-            print(f"  • ||(masked - recovery) - unmasked||_2 = {diff_norm:.6e}")
-        else:
-            masked_minus_recovery = masked_total_flat
+            check = float(np.linalg.norm(masked_minus_recovery - unmasked_total_flat))
+            print(f"  • ||(masked - recovery) - unmasked||_2 = {check:.6e}")
 
-        # FedAvg bình quân gia quyền từ dữ liệu nhận được (chỉ survivors)
-        total_weight = float(sum(fr.num_examples for _, fr in results))
+        # ======= FedAvg trên DỮ LIỆU ĐÃ UNMASK =======
+        total_weight = float(sum(w for _, w in corrected_nds_list))
         accum = None
-        for nds, (_, fr) in zip(client_masked_nds, results):
-            w = fr.num_examples
+        for nds, w in corrected_nds_list:
             if accum is None:
                 accum = [arr.astype(np.float32) * (w / total_weight) for arr in nds]
             else:
@@ -193,36 +206,27 @@ class P1FedAvg(FedAvg):
                     accum[i] += nds[i].astype(np.float32) * (w / total_weight)
 
         print(f"  • Tham số toàn cục (preview) gửi về: {_preview(accum)}")
-
-        # Đánh giá trên server
         loss, acc = _evaluate_on_server(accum)
         print(f"  • Server Eval => loss={loss:.6f}, acc={acc:.4f}\n")
 
-        # ===== Ghi JSON gọn (head...tail) =====
-        epoch_key = f"epoch {server_round}"
+        # ===== JSON: 1 dòng mỗi list =====
         entry = {}
-        # per-client
         for r in survivors:
-            entry[f"client {r} (unmasked)"] = _head_tail(client_unmasked_flat[r])
-            entry[f"client {r} (masked)"]   = _head_tail(client_masked_flat[r])
+            entry[f"client {r} (unmasked)"] = _head_tail_str(unmasked_flat[r])
+            entry[f"client {r} (masked)"]   = _head_tail_str(masked_flat[r])
         entry["dropouts"] = dropouts
-        entry["sum (unmasked)"] = _head_tail(unmasked_total_flat)
-        entry["sum (masked)"]   = _head_tail(masked_total_flat)
+        entry["sum (unmasked)"] = _head_tail_str(unmasked_total_flat)
+        entry["sum (masked)"]   = _head_tail_str(masked_total_flat)
         if recovery_total is not None:
-            entry["recovery sum (masked)"] = _head_tail(recovery_total)
-            entry["(masked - recovery)"]   = _head_tail(masked_minus_recovery)
+            entry["recovery sum (masked)"] = _head_tail_str(recovery_total)
+            entry["(masked - recovery)"]   = _head_tail_str(masked_total_flat - recovery_total)
         entry["loss"] = float(round(loss, JSON_NDIGITS))
         entry["accuracy"] = float(round(acc, JSON_NDIGITS))
-        entry["server global weights"] = _head_tail(_flatten(accum))
+        entry["server global weights"] = _head_tail_str(_flatten(accum))
 
-        self.protocol_log[epoch_key] = entry
-        if JSON_SPLIT_PER_EPOCH:
-            with open(f"protocol1_epoch_{server_round}.json", "w", encoding="utf-8") as f:
-                json.dump(entry, f, ensure_ascii=False, indent=2, sort_keys=True)
-        with open(self.json_path, "w", encoding="utf-8") as f:
-            json.dump(self.protocol_log, f, ensure_ascii=False, indent=2, sort_keys=True)
+        self._dump(server_round, entry)
 
-        # Cập nhật expected_alive cho vòng kế: chính là các survivors
+        # update expected alive = survivors cho vòng sau
         self.expected_alive = set(survivors)
 
         aggregated = ndarrays_to_parameters([a for a in accum])
@@ -230,15 +234,12 @@ class P1FedAvg(FedAvg):
 
 def main():
     initial_parameters = get_initial_parameters()
-
     strategy = P1FedAvg(
         initial_parameters=initial_parameters,
-        # quan trọng: cho phép chạy tiếp với >=3 client
         min_fit_clients=3,
         min_evaluate_clients=3,
         min_available_clients=3,
     )
-
     print("[P1-Server] Khởi động gRPC server (compat) tại 127.0.0.1:8081 ...", flush=True)
     fl.server.start_server(
         server_address="127.0.0.1:8081",

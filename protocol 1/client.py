@@ -22,9 +22,8 @@ class FlowerClientP1(fl.client.NumPyClient):
         self.rank = rank
         self.masker = Protocol1Masker(rank=self.rank, num_clients=self.num_clients)
         self.local_round = 0
-        print(f"[P1-Client rank={self.rank}] Dataset shard size = {len(self.train_loader.dataset)}")
+        print(f"[P1-Client rank={self.rank}] Using FULL train set (size={len(self.train_loader.dataset)}).")
 
-    # --- Flower bridge ---
     def get_parameters(self):
         return [val.detach().cpu().numpy() for _, val in self.model.state_dict().items()]
 
@@ -34,7 +33,6 @@ class FlowerClientP1(fl.client.NumPyClient):
         self.model.load_state_dict(state_dict, strict=True)
 
     def fit(self, parameters, config):
-        # cập nhật tham số toàn cục
         self.set_parameters(parameters)
 
         # Train 1 epoch (demo)
@@ -54,19 +52,18 @@ class FlowerClientP1(fl.client.NumPyClient):
         # Round id
         self.local_round = self.masker.next_round()
 
-        # Mask + emit per-peer contributions để phục hồi nếu peer rớt
-        roster = list(range(self.num_clients))  # danh sách rank [0..n-1]
+        # Mask + emit per-peer contributions (để server gỡ khi có dropout)
+        roster = list(range(self.num_clients))
         masked, contribs = self.masker.mask_and_contribs(unmasked, round_id=self.local_round, roster=roster)
 
-        # Log client
         print(f"[P1-Client rank={self.rank} | Round {self.local_round}]")
         print(f"  • Preview params (gốc):    {preview_params(unmasked)}")
         print(f"  • Preview params (masked): {preview_params(masked)}")
         print(f"  • ||masked - gốc||_2 = {l2_diff(masked, unmasked):.6f}")
 
-        # Chuẩn bị metrics: unmasked/masked flatten + contribs (mỗi peer một vector)
+        # Gửi kèm flatten để server kiểm chứng log
         flat_unmasked = flatten_list(unmasked).astype(np.float32).tolist()
-        flat_masked = flatten_list(masked).astype(np.float32).tolist()
+        flat_masked   = flatten_list(masked).astype(np.float32).tolist()
 
         metrics = {
             "rank": str(self.rank),
@@ -95,16 +92,15 @@ class FlowerClientP1(fl.client.NumPyClient):
         return float(loss), len(self.test_loader.dataset), {"accuracy": float(accuracy)}
 
 if __name__ == "__main__":
-    # === cấu hình P1 ===
     NUM_CLIENTS = 5
     rank = assign_rank(num_clients=NUM_CLIENTS)
 
+    # DÙNG FULL DATASET: gọi get_data_loaders() KHÔNG truyền rank/num_clients
     model = SimpleMLP().to(DEVICE)
-    train_loader, test_loader = get_data_loaders(rank=rank, num_clients=NUM_CLIENTS)
+    train_loader, test_loader = get_data_loaders()
 
     client = FlowerClientP1(model, train_loader, test_loader, num_clients=NUM_CLIENTS, rank=rank)
-    # API compat mới
     fl.client.start_client(
-        server_address="127.0.0.1:8081",  # dùng port khác để tách với P0
+        server_address="127.0.0.1:8081",
         client=client.to_client(),
     )
