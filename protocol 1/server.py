@@ -68,14 +68,6 @@ def _evaluate_on_server(nds):
     return float(total_loss / total), float(correct / total)
 
 # ===== JSON helpers: in 1 dòng/list =====
-def _fmt_line(arr, ndigits=JSON_NDIGITS):
-    """Format list số trên MỘT dòng: [a, b, c, ..., y, z]"""
-    def fmt(x):
-        if ndigits is None:
-            return str(float(x))
-        return f"{float(x):.{int(ndigits)}f}"
-    return "[" + ", ".join(arr) + "]"
-
 def _head_tail_str(array_like, head=JSON_HEAD, tail=JSON_TAIL, ndigits=JSON_NDIGITS):
     if array_like is None:
         return "[]"
@@ -83,7 +75,6 @@ def _head_tail_str(array_like, head=JSON_HEAD, tail=JSON_TAIL, ndigits=JSON_NDIG
     if ndigits is not None:
         arr = np.round(arr, decimals=int(ndigits))
     n = arr.size
-    elems = []
     if n <= head + tail:
         elems = [f"{float(x):.{int(ndigits)}f}" for x in arr]
     else:
@@ -93,7 +84,6 @@ def _head_tail_str(array_like, head=JSON_HEAD, tail=JSON_TAIL, ndigits=JSON_NDIG
     return "[" + ", ".join(elems) + "]"
 
 def _unflatten_like(vec_flat: np.ndarray, template_nds):
-    """Chuyển vector phẳng -> list np.array theo shape của template_nds."""
     out, idx = [], 0
     for a in template_nds:
         size = a.size
@@ -108,14 +98,22 @@ class P1FedAvg(FedAvg):
         self.json_path = "protocol1.json"
         self.protocol_log = {}
         self.expected_alive = set(range(P1_NCLIENTS))
-        self._reset_json()
-
-    def _reset_json(self):
         try:
             if os.path.exists(self.json_path):
                 os.remove(self.json_path)
         except Exception:
             pass
+
+    # >>>>>>>>>>>>>>>>>>>>  QUAN TRỌNG: ĐỒNG BỘ ROUND TỪ SERVER  <<<<<<<<<<<<<<<<<<
+    def configure_fit(self, server_round, parameters, client_manager):
+        ins = super().configure_fit(server_round, parameters, client_manager)
+        # gắn round_id (và tổng N) vào config gửi xuống tất cả clients
+        for _, fitins in ins:
+            cfg = dict(fitins.config) if fitins.config is not None else {}
+            cfg["round_id"] = str(server_round)
+            cfg["num_clients_total"] = str(P1_NCLIENTS)
+            fitins.config = cfg
+        return ins
 
     def _dump(self, server_round: int, entry: dict):
         self.protocol_log[f"epoch {server_round}"] = entry
@@ -132,7 +130,7 @@ class P1FedAvg(FedAvg):
         per_client_weight = []
         unmasked_flat = {}
         masked_flat = {}
-        contribs = {}  # rank -> {peer_rank: vec_flat}
+        contribs = {}
         survivors = set()
 
         for client_proxy, fit_res in results:
@@ -150,7 +148,6 @@ class P1FedAvg(FedAvg):
             cdict = json.loads(m.get("contribs", "{}"))
             contribs[rank] = {int(k): np.array(v, dtype=np.float32) for k, v in cdict.items()}
 
-        # dropout
         dropouts = sorted(list(self.expected_alive - survivors))
         survivors = sorted(list(survivors))
         print(f"  • Survivors: {survivors} | Dropouts: {dropouts}")
@@ -172,7 +169,7 @@ class P1FedAvg(FedAvg):
         recovery_total = np.zeros_like(masked_total_flat, dtype=np.float32) if masked_total_flat is not None else None
 
         for nds, w, rank in zip(masked_nds_list, per_client_weight, survivors):
-            # vector correction cho client này: sum_{v in dropouts} contribs[rank][v]
+            # correction cho client này: sum_{v in dropouts} contribs[rank][v]
             corr_vec = None
             per_peer = contribs.get(rank, {})
             for v in dropouts:
@@ -189,7 +186,7 @@ class P1FedAvg(FedAvg):
             corrected = [a.astype(np.float32) - c.astype(np.float32) for a, c in zip(nds, corr_parts)]
             corrected_nds_list.append((corrected, w))
 
-        # kiểm chứng: (sum masked) - (sum recovery) ≈ (sum unmasked)
+        # Kiểm chứng: (sum masked) - (sum recovery) ≈ (sum unmasked)
         if masked_total_flat is not None and recovery_total is not None and unmasked_total_flat is not None:
             masked_minus_recovery = masked_total_flat - recovery_total
             check = float(np.linalg.norm(masked_minus_recovery - unmasked_total_flat))
@@ -217,7 +214,7 @@ class P1FedAvg(FedAvg):
         entry["dropouts"] = dropouts
         entry["sum (unmasked)"] = _head_tail_str(unmasked_total_flat)
         entry["sum (masked)"]   = _head_tail_str(masked_total_flat)
-        if recovery_total is not None:
+        if masked_total_flat is not None and recovery_total is not None:
             entry["recovery sum (masked)"] = _head_tail_str(recovery_total)
             entry["(masked - recovery)"]   = _head_tail_str(masked_total_flat - recovery_total)
         entry["loss"] = float(round(loss, JSON_NDIGITS))
@@ -225,8 +222,6 @@ class P1FedAvg(FedAvg):
         entry["server global weights"] = _head_tail_str(_flatten(accum))
 
         self._dump(server_round, entry)
-
-        # update expected alive = survivors cho vòng sau
         self.expected_alive = set(survivors)
 
         aggregated = ndarrays_to_parameters([a for a in accum])

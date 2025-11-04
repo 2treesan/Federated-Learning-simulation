@@ -35,6 +35,10 @@ class FlowerClientP1(fl.client.NumPyClient):
     def fit(self, parameters, config):
         self.set_parameters(parameters)
 
+        # round_id do SERVER cung cấp (đồng bộ cho tất cả clients)
+        round_id = int(config.get("round_id", 1))
+        self.local_round = round_id
+
         # Train 1 epoch (demo)
         self.model.train()
         for _ in range(1):
@@ -49,19 +53,16 @@ class FlowerClientP1(fl.client.NumPyClient):
         # Lấy tham số local (unmasked)
         unmasked = self.get_parameters()
 
-        # Round id
-        self.local_round = self.masker.next_round()
-
         # Mask + emit per-peer contributions (để server gỡ khi có dropout)
-        roster = list(range(self.num_clients))
-        masked, contribs = self.masker.mask_and_contribs(unmasked, round_id=self.local_round, roster=roster)
+        roster = list(range(self.num_clients))  # vẫn lấy [0..N-1]
+        masked, contribs = self.masker.mask_and_contribs(unmasked, round_id=round_id, roster=roster)
 
         print(f"[P1-Client rank={self.rank} | Round {self.local_round}]")
         print(f"  • Preview params (gốc):    {preview_params(unmasked)}")
         print(f"  • Preview params (masked): {preview_params(masked)}")
         print(f"  • ||masked - gốc||_2 = {l2_diff(masked, unmasked):.6f}")
 
-        # Gửi kèm flatten để server kiểm chứng log
+        # Gửi flatten để log
         flat_unmasked = flatten_list(unmasked).astype(np.float32).tolist()
         flat_masked   = flatten_list(masked).astype(np.float32).tolist()
 
@@ -95,7 +96,7 @@ if __name__ == "__main__":
     NUM_CLIENTS = 5
     rank = assign_rank(num_clients=NUM_CLIENTS)
 
-    # DÙNG FULL DATASET: gọi get_data_loaders() KHÔNG truyền rank/num_clients
+    # FULL DATASET
     model = SimpleMLP().to(DEVICE)
     train_loader, test_loader = get_data_loaders()
 
